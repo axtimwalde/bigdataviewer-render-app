@@ -143,7 +143,7 @@ public class RenderAppImageLoader extends AbstractViewerSetupImgLoader<ARGBType,
 				mipmapTransforms[l] = mipmapTransform;
 			}
 
-			cache = new VolatileGlobalCellCache(1, 1, numScales, 45);
+			cache = new VolatileGlobalCellCache(1, 1, numScales, Math.max( 2, Runtime.getRuntime().availableProcessors() - 10 ) );
 
 			final SliceLoader sliceLoader;
 			if (p.averageZ) {
