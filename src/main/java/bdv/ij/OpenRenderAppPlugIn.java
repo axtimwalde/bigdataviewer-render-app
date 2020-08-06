@@ -1,39 +1,31 @@
 package bdv.ij;
 
-import java.io.File;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.net.URL;
 import java.util.ArrayList;
-import java.util.HashMap;
 
 import com.google.common.reflect.TypeToken;
 import com.google.gson.Gson;
 
-import bdv.BigDataViewer;
-import bdv.ij.util.ProgressWriterIJ;
-import bdv.img.render.Parameters;
-import bdv.img.render.RenderAppImageLoader;
-import bdv.img.render.StackInfo;
-import bdv.spimdata.SequenceDescriptionMinimal;
-import bdv.spimdata.SpimDataMinimal;
-import bdv.spimdata.WrapBasicImgLoader;
-import bdv.tools.brightness.SetupAssignments;
-import bdv.viewer.ViewerOptions;
-import bdv.viewer.VisibilityAndGrouping;
+import bdv.render.Bounds;
+import bdv.render.Parameters;
+import bdv.render.RenderSource;
+import bdv.render.Rest;
+import bdv.render.StackInfo;
+import bdv.util.BdvFunctions;
+import bdv.util.BdvOptions;
+import bdv.util.BdvStackSource;
+import bdv.util.volatiles.SharedQueue;
+import bdv.viewer.Source;
 import ij.ImageJ;
 import ij.gui.GenericDialog;
 import ij.plugin.PlugIn;
-import mpicbg.spim.data.generic.sequence.BasicViewSetup;
-import mpicbg.spim.data.registration.ViewRegistration;
-import mpicbg.spim.data.registration.ViewRegistrations;
-import mpicbg.spim.data.sequence.Channel;
 import mpicbg.spim.data.sequence.FinalVoxelDimensions;
-import mpicbg.spim.data.sequence.TimePoint;
-import mpicbg.spim.data.sequence.TimePoints;
 import net.imglib2.FinalDimensions;
 import net.imglib2.realtransform.AffineTransform3D;
-import net.imglib2.util.Intervals;
+import net.imglib2.type.numeric.ARGBType;
+import net.imglib2.type.volatiles.VolatileARGBType;
 
 /**
  * ImageJ plugin to show a render DB stack in BigDataViewer.
@@ -45,6 +37,19 @@ public class OpenRenderAppPlugIn implements PlugIn {
 	final private Gson gson = new Gson();
 
 	private static Parameters params = new Parameters();
+
+	final static public int getNumScales(
+			long width,
+			long height,
+			final long tileWidth,
+			final long tileHeight) {
+		int i = 1;
+
+		while ((width >>= 1) > tileWidth && (height >>= 1) > tileHeight)
+			++i;
+
+		return i;
+	}
 
 	public static void main(final String... args) {
 
@@ -87,13 +92,14 @@ public class OpenRenderAppPlugIn implements PlugIn {
 				projectStacks[i] = stackInfo.stackId.project + " / " + stackInfo.stackId.stack;
 			}
 
-			final GenericDialog gd2 = new GenericDialog("BigDataViewer Render App");
+			final GenericDialog gd2 = new GenericDialog("RenderView");
 
 			gd2.addChoice("Stack : ", projectStacks, params.project + " / " + params.stack);
 			gd2.addNumericField("Tile_width : ", params.tileWidth, 0);
 			gd2.addNumericField("Tile_height : ", params.tileHeight, 0);
 			gd2.addCheckbox("average_z_sections", params.averageZ);
 			gd2.addCheckbox("apply_contrast_filter", params.filter);
+			gd2.addCheckbox("rewrite_mipmap_URLs", params.rewrite);
 			gd2.showDialog();
 
 			if (gd2.wasCanceled())
@@ -108,6 +114,7 @@ public class OpenRenderAppPlugIn implements PlugIn {
 			params.tileHeight = (int)gd2.getNextNumber();
 			params.averageZ = gd2.getNextBoolean();
 			params.filter = gd2.getNextBoolean();
+			params.filter = gd2.getNextBoolean();
 
 			run(params.clone(), gson);
 		}
@@ -116,53 +123,83 @@ public class OpenRenderAppPlugIn implements PlugIn {
 
 	final static public void run(final Parameters p, final Gson gson) throws IOException {
 
-		final double pd = 10;
+		final String displayName = String.format("RenderView %s %s", p.project, p.stack);
 
-		final RenderAppImageLoader imgLoader = new RenderAppImageLoader(p, gson, 0, pd, 4);
+		final Bounds bounds = Rest.getStackBounds(gson, p.baseUrl, p.owner, p.project, p.stack);
+		if (bounds == null) return;
 
-		// get calibration and image size
-		final FinalDimensions size = new FinalDimensions(Intervals.dimensionsAsLongArray(imgLoader.getImage(0)));
-		final FinalVoxelDimensions voxelSize = new FinalVoxelDimensions("px", 1, 1, pd);
+		final double[] resolution = Rest.getStackResolution(gson, p.baseUrl, p.owner, p.project, p.stack);
+		final double zScale = resolution[0] / resolution[2];
 
-		final int numTimepoints = 1;
-		final int numSetups = 1;
+		final long[] offset = new long[] { (long) bounds.minX, (long) bounds.minY, (long) bounds.minZ };
+		final FinalDimensions size =
+				new FinalDimensions(
+						new long[]{
+								(long)Math.ceil(bounds.maxX - bounds.minX + 1),
+								(long)Math.ceil(bounds.maxY - bounds.minY + 1),
+								(long)Math.ceil(bounds.maxZ - bounds.minZ + 1)});;
+		final int numScales = getNumScales(size.dimension(0), size.dimension(1), p.tileWidth, p.tileHeight);;
 
-		// create setups from channels
-		final HashMap<Integer, BasicViewSetup> setups = new HashMap<Integer, BasicViewSetup>(numSetups);
-		for (int s = 0; s < numSetups; ++s) {
-			final BasicViewSetup setup = new BasicViewSetup(s, String.format("channel %d", s + 1), size, voxelSize);
-			setup.setAttribute(new Channel(s + 1));
-			setups.put(s, setup);
+		final double[][] mipmapResolutions = new double[numScales][];
+		final long[][] dimensions = new long[numScales][];
+		final AffineTransform3D[] mipmapTransforms = new AffineTransform3D[numScales];
+		final int[] zScales = new int[numScales];
+		for (int l = 0; l < numScales; ++l) {
+
+			final int sixy = 1 << l;
+			final int siz = p.averageZ ? Math.max(1, (int)Math.round(sixy / zScale)) : 1;
+
+			mipmapResolutions[l] = new double[] { sixy, sixy, siz };
+			dimensions[l] = new long[] {
+					Math.max(1, size.dimension(0) >> l),
+					Math.max(1, size.dimension(1) >> l),
+					Math.max(1, size.dimension(2) / siz)};
+			zScales[l] = siz;
+
+			final AffineTransform3D mipmapTransform = new AffineTransform3D();
+
+			mipmapTransform.set(sixy, 0, 0);
+			mipmapTransform.set(sixy, 1, 1);
+			mipmapTransform.set(zScale * siz, 2, 2);
+
+//			mipmapTransform.set(0.5 * (sixy - 1), 0, 3);
+//			mipmapTransform.set(0.5 * (sixy - 1), 1, 3);
+			mipmapTransform.set(0.5 * (zScale * siz - 1), 2, 3);
+
+			mipmapTransforms[l] = mipmapTransform;
 		}
 
-		// create timepoints
-		final ArrayList<TimePoint> timepoints = new ArrayList<TimePoint>(numTimepoints);
-		for (int t = 0; t < numTimepoints; ++t)
-			timepoints.add(new TimePoint(t));
-		final SequenceDescriptionMinimal seq = new SequenceDescriptionMinimal(new TimePoints(timepoints), setups, imgLoader, null);
+		final BdvOptions bdvOptions = BdvOptions.options();
+		bdvOptions.frameTitle(displayName);
 
-		// create ViewRegistrations from the images calibration
-		final AffineTransform3D sourceTransform = new AffineTransform3D();
-		// sourceTransform.set( 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0 );
-		final ArrayList<ViewRegistration> registrations = new ArrayList<ViewRegistration>();
-		for (int t = 0; t < numTimepoints; ++t)
-			for (int s = 0; s < numSetups; ++s)
-				registrations.add(new ViewRegistration(t, s, sourceTransform));
+		final SharedQueue sharedQueue = new SharedQueue(Math.max(1, Runtime.getRuntime().availableProcessors() / 2));
+		final FinalVoxelDimensions voxelDimensions = new FinalVoxelDimensions("nm", mipmapResolutions[0]);
 
-		final File basePath = new File(".");
-		final SpimDataMinimal spimData = new SpimDataMinimal(basePath, seq, new ViewRegistrations(registrations));
-		WrapBasicImgLoader.wrapImgLoaderIfNecessary(spimData);
+		final Source<ARGBType> source = RenderSource.getSource(
+				params,
+				displayName,
+				dimensions,
+				mipmapResolutions,
+				zScales,
+				offset,
+				voxelDimensions);
+		final Source<VolatileARGBType> volatileSource = RenderSource.getVolatileSource(
+				params,
+				displayName,
+				dimensions,
+				mipmapResolutions,
+				zScales,
+				offset,
+				voxelDimensions,
+				sharedQueue);
 
-		final BigDataViewer bdv = BigDataViewer.open(spimData, "BigDataViewer", new ProgressWriterIJ(), ViewerOptions.options());
-		final SetupAssignments sa = bdv.getSetupAssignments();
-		final VisibilityAndGrouping vg = bdv.getViewer().getVisibilityAndGrouping();
+//		ImageJFunctions.show(source.getSource(0, 3));
 
-		final AffineTransform3D transform = new AffineTransform3D();
-		transform.set(
-				1, 0, 0, -(size.dimension(0) - bdv.getViewerFrame().getWidth()) / 2,
-				0, 1, 0, -(size.dimension(1) - bdv.getViewerFrame().getHeight()) / 2,
-				0, 0, 1, -(size.dimension(2) / 2 * pd));
-		System.out.println(transform);
-		bdv.getViewer().setCurrentViewerTransform(transform);
+		// show in BDV
+		final BdvStackSource<VolatileARGBType> stackSource = BdvFunctions.show(volatileSource, bdvOptions);
+		stackSource.setDisplayRange(0, 255);
+
+		// reuse BDV handle
+		bdvOptions.addTo(stackSource.getBdvHandle());
 	}
 }
